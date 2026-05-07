@@ -75,8 +75,9 @@ def _fit_riesztree(n: int, p: int, depth: int, splitter: str, seed: int = 0) -> 
     t0 = time.perf_counter()
     est.fit(df)
     fit_s = time.perf_counter() - t0
-    # n_aug ≈ 2n for ATE; pull the actual count off the predictor's tree.
-    n_aug = int(getattr(est.predictor_.tree, "n_aug", 2 * n))
+    # n_aug ≈ 2n for ATE. Some growable->Node adapters set n_aug=0 on
+    # the root since the growable doesn't track it; fall back to 2*n.
+    n_aug = int(getattr(est.predictor_.tree, "n_aug", 2 * n)) or (2 * n)
     return Result(f"riesztree-{splitter}", n_aug, p, depth, fit_s)
 
 

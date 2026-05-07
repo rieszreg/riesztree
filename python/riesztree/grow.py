@@ -471,6 +471,36 @@ def grow_depthwise(
         )
         return node_from_growable_flat_tree(growable, loss=loss)
 
+    # Iterative-grow Cython driver for splitter='exact' with per-feature
+    # presort propagation. Eligible when no categorical features, no
+    # early stopping, no max_features subsampling, and a built-in loss
+    # (the Cython dispatch_leaf_loss kernel doesn't yet route to user
+    # cfuncs — those continue to use the per-feature Python fallback).
+    from .fast._splitter import LOSS_USER_CFUNC
+    cython_exact_eligible = (
+        splitter == "exact"
+        and not categorical_features
+        and n_features_to_consider == n_features
+        and fast_loss_kind is not None
+        and fast_loss_kind != LOSS_USER_CFUNC
+        and early_stopping_rounds is None
+        and aug_valid is None
+    )
+    if cython_exact_eligible:
+        from .fast._grow_c import grow_depthwise_exact_c
+        from .fast._tree import node_from_growable_flat_tree
+        growable = grow_depthwise_exact_c(
+            np.ascontiguousarray(features, dtype=np.float64), D, C,
+            int(max_depth),
+            int(min_samples_split),
+            int(eff_min_orig_leaf),
+            float(min_impurity_decrease),
+            int(fast_loss_kind),
+            float(bounded_lo),
+            float(bounded_hi),
+        )
+        return node_from_growable_flat_tree(growable, loss=loss)
+
     if pms_eligible:
         _recurse_pms_depthwise(
             root, np.arange(features.shape[0]),

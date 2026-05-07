@@ -516,3 +516,259 @@ def grow_depthwise_hist_c(
             worklist.append((left_idx, start, mid, depth_v + 1, parent_slot))
 
     return tree
+
+
+# ===========================================================================
+# Iterative-grow Cython driver for splitter='exact' with presort propagation.
+#
+# At fit start: per-feature presort `sorted_idx[j] = argsort(features[:, j])`.
+# Maintain the invariant that, for any active node with row-range
+# `[start, end)`, `sorted_idx[j, start:end]` contains the node's rows in
+# ascending order of feature j.
+#
+# Best-split sweep: per feature, walk `sorted_idx[j, start:end]` once.
+# Cumulative (D, C, n_orig) at each prefix; gain = parent_loss - L_left -
+# L_right. No per-leaf argsort, no per-leaf cumsum allocation, no per-leaf
+# `feature_col.take(idx)`.
+#
+# Post-split bookkeeping: for each non-split feature g, partition
+# `sorted_idx[g, start:end]` so left-rows precede right-rows while
+# preserving g-sorted order within each group. This costs O(n_leaf) per
+# feature per split; total O(p · n_aug · tree_depth).
+
+cdef void _stable_partition_sorted_slice(
+    i64[::1] sorted_slice,
+    i64[::1] workspace,
+    u8[::1] goes_left,
+    Py_ssize_t n,
+    Py_ssize_t left_count,
+) noexcept nogil:
+    """Stable in-place partition of ``sorted_slice[:n]`` so that rows
+    with ``goes_left[row] == 1`` come first, others after, each group
+    preserving its original order. ``workspace[:n]`` must be writable
+    scratch.
+
+    ``left_count`` is the number of left-going rows (caller has already
+    counted; we use it to seed the right-pointer)."""
+    cdef Py_ssize_t i
+    cdef Py_ssize_t li = 0
+    cdef Py_ssize_t ri = left_count
+    cdef i64 row
+    for i in range(n):
+        row = sorted_slice[i]
+        if goes_left[row]:
+            workspace[li] = row
+            li += 1
+        else:
+            workspace[ri] = row
+            ri += 1
+    for i in range(n):
+        sorted_slice[i] = workspace[i]
+
+
+def grow_depthwise_exact_c(
+    cnp.ndarray[f64, ndim=2, mode="c"] features,
+    cnp.ndarray[f64, ndim=1] D,
+    cnp.ndarray[f64, ndim=1] C,
+    int max_depth,
+    int min_samples_split,
+    int min_orig_leaf,
+    double min_impurity_decrease,
+    int loss_kind,
+    double bounded_lo,
+    double bounded_hi,
+):
+    """Iterative depthwise grow on the exact-split path with per-feature
+    presort propagation. See module-level comment block above for the
+    invariant and complexity.
+
+    Scope: ``splitter='exact'``, no categorical features, no early
+    stopping, no max_features subsampling, built-in or user-registered
+    loss. Other configurations keep the existing Python recursion.
+    """
+    cdef Py_ssize_t n_aug = D.shape[0]
+    cdef int n_features = features.shape[1]
+
+    cdef Py_ssize_t max_nodes_cap
+    if max_depth >= 31:
+        max_nodes_cap = max(2 * n_aug + 1, 1024)
+    else:
+        max_nodes_cap = (1 << (max_depth + 1)) + 1
+        if max_nodes_cap < 1024:
+            max_nodes_cap = 1024
+    cdef GrowableFlatTree tree = GrowableFlatTree(max_nodes_cap)
+
+    # Pre-compute per-feature presort. Each row p[j, k] = k-th-sorted
+    # row index by feature j. Column-major-by-feature for cache-friendly
+    # per-feature sweeps.
+    cdef cnp.ndarray[i64, ndim=2, mode="c"] sorted_idx = np.empty((n_features, n_aug), dtype=np.int64)
+    cdef Py_ssize_t j_pre
+    for j_pre in range(n_features):
+        sorted_idx[j_pre, :] = np.argsort(features[:, j_pre], kind="mergesort")
+    cdef i64[:, ::1] sorted_v = sorted_idx
+
+    # Workspace for stable partitioning. Reused across all splits.
+    cdef cnp.ndarray[i64, ndim=1] workspace_arr = np.empty(n_aug, dtype=np.int64)
+    cdef i64[::1] workspace_v = workspace_arr
+
+    # Per-row "goes left" bitmask. Reused across splits; we set it
+    # before each non-split-feature partition and zero it after.
+    cdef cnp.ndarray[u8, ndim=1] goes_left_arr = np.zeros(n_aug, dtype=np.uint8)
+    cdef u8[::1] goes_left_v = goes_left_arr
+
+    cdef f64[:, :] features_v = features
+    cdef f64[::1] D_v = D
+    cdef f64[::1] C_v = C
+
+    # Per-loop variables.
+    cdef Py_ssize_t i, k
+    cdef i64 row
+    cdef double total_D, total_C
+    cdef i64 total_orig
+    cdef double parent_loss
+    cdef Py_ssize_t node_idx, start, end, mid
+    cdef int depth_v, best_feat, best_k
+    cdef double gain_v, threshold_v, best_gain
+    cdef Py_ssize_t j
+    cdef double D_l, C_l, D_r, C_r, L_l, L_r, gain
+    cdef i64 n_l, n_r
+    cdef double prev_val, curr_val
+    cdef Py_ssize_t left_count
+    cdef double left_D, right_D, left_C, right_C, left_alpha, right_alpha
+    cdef i64 left_orig, right_orig
+    cdef Py_ssize_t left_idx_node, right_idx_node
+    cdef double root_D = 0.0
+    cdef double root_C = 0.0
+    cdef i64 root_orig = 0
+    cdef double root_alpha
+    cdef Py_ssize_t root_idx
+
+    # Bootstrap root.
+    for i in range(n_aug):
+        root_D += D_v[i]
+        root_C += C_v[i]
+        if D_v[i] > 0.0:
+            root_orig += 1
+    root_alpha = dispatch_alpha_at_opt(loss_kind, root_D, root_C, bounded_lo, bounded_hi)
+    root_idx = _add_leaf(tree, root_D, root_C, root_orig, root_alpha, 0)
+
+    # Worklist entries: (node_idx, start, end, depth, total_D, total_C, total_orig).
+    # We carry the parent's totals on the worklist so we don't recompute
+    # them per-pop; the totals were computed when the node was added as
+    # a leaf (or at root bootstrap).
+    cdef list worklist = [(root_idx, 0, n_aug, 0, root_D, root_C, root_orig)]
+    cdef i64[::1] tree_n_orig_v = tree.n_orig
+    cdef object item
+
+    while worklist:
+        item = worklist.pop()
+        node_idx = item[0]
+        start = item[1]
+        end = item[2]
+        depth_v = item[3]
+        total_D = item[4]
+        total_C = item[5]
+        total_orig = item[6]
+
+        if depth_v >= max_depth:
+            continue
+        if total_orig < min_samples_split:
+            continue
+
+        parent_loss = dispatch_leaf_loss(loss_kind, total_D, total_C, bounded_lo, bounded_hi)
+        best_gain = -INFINITY
+        best_feat = -1
+        best_k = -1
+
+        # Per-feature sweep using the presorted slice sorted_v[j, start:end].
+        for j in range(n_features):
+            D_l = 0.0
+            C_l = 0.0
+            n_l = 0
+            for k in range(end - start - 1):
+                row = sorted_v[j, start + k]
+                D_l += D_v[row]
+                C_l += C_v[row]
+                if D_v[row] > 0.0:
+                    n_l += 1
+                # Skip if next row has same value (tie — split here would
+                # put equal-valued rows on opposite sides).
+                prev_val = features_v[row, j]
+                curr_val = features_v[sorted_v[j, start + k + 1], j]
+                if prev_val == curr_val:
+                    continue
+                n_r = total_orig - n_l
+                if n_l < min_orig_leaf or n_r < min_orig_leaf:
+                    continue
+                D_r = total_D - D_l
+                C_r = total_C - C_l
+                L_l = dispatch_leaf_loss(loss_kind, D_l, C_l, bounded_lo, bounded_hi)
+                L_r = dispatch_leaf_loss(loss_kind, D_r, C_r, bounded_lo, bounded_hi)
+                if not isfinite(L_l) or not isfinite(L_r):
+                    continue
+                gain = parent_loss - L_l - L_r
+                if gain > best_gain:
+                    best_gain = gain
+                    best_feat = j
+                    best_k = k
+
+        if best_feat < 0 or best_gain <= min_impurity_decrease:
+            continue
+
+        # Threshold = midpoint between feature values at split boundary.
+        threshold_v = 0.5 * (
+            features_v[sorted_v[best_feat, start + best_k], best_feat]
+            + features_v[sorted_v[best_feat, start + best_k + 1], best_feat]
+        )
+
+        # Compute child payloads by walking the split-feature's prefix.
+        left_D = 0.0
+        left_C = 0.0
+        left_orig = 0
+        for k in range(best_k + 1):
+            row = sorted_v[best_feat, start + k]
+            left_D += D_v[row]
+            left_C += C_v[row]
+            if D_v[row] > 0.0:
+                left_orig += 1
+        right_D = total_D - left_D
+        right_C = total_C - left_C
+        right_orig = total_orig - left_orig
+
+        left_alpha = dispatch_alpha_at_opt(loss_kind, left_D, left_C, bounded_lo, bounded_hi)
+        right_alpha = dispatch_alpha_at_opt(loss_kind, right_D, right_C, bounded_lo, bounded_hi)
+
+        mid = start + best_k + 1
+        left_count = best_k + 1   # number of rows going left
+
+        # Set goes_left bitmask: rows in sorted_v[best_feat, start:mid] go left.
+        for k in range(start, mid):
+            goes_left_v[sorted_v[best_feat, k]] = 1
+
+        # Partition sorted_v[g, start:end] for each g != best_feat.
+        # The split-feature's slice is already correctly partitioned
+        # (left rows are sorted ≤ threshold, right rows are sorted >).
+        for j in range(n_features):
+            if j == best_feat:
+                continue
+            _stable_partition_sorted_slice(
+                sorted_v[j, start:end],
+                workspace_v[start:end],
+                goes_left_v,
+                end - start,
+                left_count,
+            )
+
+        # Clear goes_left for the rows we just set.
+        for k in range(start, mid):
+            goes_left_v[sorted_v[best_feat, k]] = 0
+
+        left_idx_node = _add_leaf(tree, left_D, left_C, left_orig, left_alpha, depth_v + 1)
+        right_idx_node = _add_leaf(tree, right_D, right_C, right_orig, right_alpha, depth_v + 1)
+        _convert_to_internal(tree, node_idx, best_feat, threshold_v, best_gain, left_idx_node, right_idx_node)
+
+        # Push children. Carry their totals.
+        worklist.append((right_idx_node, mid, end, depth_v + 1, right_D, right_C, right_orig))
+        worklist.append((left_idx_node, start, mid, depth_v + 1, left_D, left_C, left_orig))
+
+    return tree
