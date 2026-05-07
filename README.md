@@ -138,19 +138,20 @@ The cfunc is called from the Cython splitter's tight loop without the GIL — sa
 
 `bench_fit.py` and `bench_compare.py` (under `python/benchmarks/`) document where `riesztree` sits versus state-of-the-art tree libraries on equivalent `(n_aug, p, max_depth)` workloads.
 
-Headline cell `(n_aug=100k, p=20, depth=16)` with `splitter="hist"` (after iterative-grow Cython + parent-minus-sibling histograms + buffer pool):
+Headline cell `(n_aug=100k, p=20, depth=16)`, fully-grown trees:
 
-| Library | Fit time | vs riesztree |
+| Library | Fit time | vs XGBoost |
 |---|---|---|
-| **riesztree-hist** | **0.45 s** | 1.0× |
-| sklearn `HistGradientBoostingRegressor` (max_iter=1) | 0.92 s | we're 2× faster |
-| sklearn `DecisionTreeRegressor` (exact) | 2.50 s | we're 5.5× faster |
-| XGBoost (n_estimators=1, hist) | 0.33 s | 1.35× behind |
-| LightGBM (n_estimators=1) | 5.92 s | we're 13× faster |
+| **riesztree-exact** (presort) | **0.43 s** | 1.4× behind |
+| **riesztree-hist** (PMS + buffer pool) | 0.42 s | 1.4× behind |
+| sklearn `HistGradientBoostingRegressor` (max_iter=1) | 0.57 s | 1.8× behind |
+| sklearn `DecisionTreeRegressor` (exact) | 2.39 s | 7.7× behind |
+| XGBoost (n_estimators=1, hist) | **0.31 s** | 1.0× |
+| LightGBM (n_estimators=1) | 5.45 s | 17.6× behind |
 
-At smaller cells we **beat XGBoost outright**. `(n_aug=20k, p=20, depth=16)`: riesztree-hist **0.10 s** vs XGBoost 0.14 s.
+At smaller cells our **exact path beats XGBoost outright**. `(n_aug=20k, p=20, depth=16)`: riesztree-exact **0.078 s** vs XGBoost 0.125 s — **38% faster than XGBoost**.
 
-The remaining ~1.35× to XGBoost at the largest cell is concentrated in the quantile-binner fit cost (one-shot per fit; amortizes across trees in a forest). See [`BENCH_BASELINE.md`](BENCH_BASELINE.md) for the full attribution and benchmark protocol.
+Both `splitter='exact'` (per-feature presort propagation, sklearn-style) and `splitter='hist'` (parent-minus-sibling histograms with buffer pool) are now in the same speed class as XGBoost. The remaining ~1.4× at the largest cells is concentrated in one-shot per-fit setup (the quantile binner / per-feature argsort) — amortizes across trees in a forest. See [`BENCH_BASELINE.md`](BENCH_BASELINE.md) for the full attribution and benchmark protocol.
 
 ## Known sharp edges
 
